@@ -1,0 +1,28 @@
+{
+  "schemaVersion": 1,
+  "id": "io.github.duketopceo.wisp",
+  "name": "Wisp",
+  "version": "0.9.1",
+  "author": "duketopceo",
+  "license": "AGPL-3.0-only",
+  "description": "Voice assistant: Super+D listens, Jev decides, agents spawn \u2014 state surfaced from the wispd daemon.",
+  "kinds": [
+    "service",
+    "bar-widget",
+    "overlay"
+  ],
+  "activation": "on-demand",
+  "keepLoaded": true,
+  "entryPoints": {
+    "service": "WispService.qml",
+    "barWidget": "BarWidget.qml",
+    "overlay": "Companion.qml"
+  },
+  "barWidget": {
+    "displayName": "Wisp",
+    "description": "Wisp mark: state glyph, health and spend tooltip, click to talk, middle click to stop, right click for the panel",
+    "category": "Productivity",
+    "allowMultiple": false,
+    "defaultSection": "center"
+  }
+}
