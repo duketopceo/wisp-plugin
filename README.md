@@ -14,11 +14,14 @@ omarchy plugin add https://github.com/duketopceo/wisp-plugin.git --enable
 ```
 
 The plugin shows the daemon's state. The daemon itself (`wispd`) comes from
-the source repository (the `--from-plugin` flag is newer than the last
-packaged release); nothing is installed or edited until you say yes:
+the source repository, pinned to the exact commit this plugin was built
+from (the `--from-plugin` flag is newer than the last packaged release;
+check the commit before you run anything); nothing is installed or edited until you say yes:
 
 ```sh
-git clone https://github.com/duketopceo/wisp && cd wisp
+git clone https://github.com/duketopceo/wisp
+git -C wisp checkout --detach 0467ae3d0d40c6688627545f168672e46f9b3279
+cd wisp
 python3 wispd install --from-plugin --dry-run   # every file, and the bind line
 python3 wispd install --from-plugin             # prints the same, then asks
 ```
@@ -43,4 +46,4 @@ Your settings and memory stay in `~/.config/wisp` and
 ## License
 
 AGPL-3.0-only, see LICENSE (releases up to v0.9.0 were MIT). Bundled
-third-party notices are in THIRD_PARTY_NOTICES.md. Version 0.9.1.
+third-party notices are in THIRD_PARTY_NOTICES.md. Version 0.9.2.
