@@ -6,10 +6,12 @@ import qs.Commons
 import qs.Ui
 import "components"
 import "lib/onboard.js" as Onboard
+import "lib/whatsnew.js" as WhatsNew
 
 // Popup panel for io.github.duketopceo.wisp, opened from the bar mark.
 // Four tabs: Now (the turn in flight), Agents (tasks), Memory (skills and
-// recent decisions) and Settings (Health, then the config editor). Until
+// recent decisions) and Settings (Health, then the config editor); a fifth,
+// Dev (local only), is appended when `[dev] panel = true`. Until
 // setup is finished a first-run card sits above the tabs (wispd onboard). State
 // comes only from the plugin's WispService (hostWidget.service); the tab
 // bodies are window-free components under components/. The only files read
@@ -29,7 +31,10 @@ Panel {
 
   readonly property var service: hostWidget && hostWidget.service ? hostWidget.service : null
   readonly property string dataDir: Quickshell.env("HOME") + "/.local/share/wisp"
-  readonly property var tabKeys: ["now", "agents", "memory", "settings"]
+  readonly property var baseTabs: ["now", "agents", "memory", "settings"]
+  // Dev is index 4, after Settings (index 3), and only with the flag on
+  readonly property bool devPanelOn: service !== null && service.devPanel
+  readonly property var tabKeys: service && service.devPanel ? baseTabs.concat(["devtab"]) : baseTabs
   property int tab: 0
 
   property var skills: []
@@ -39,17 +44,56 @@ Panel {
   // (a skip is never written anywhere)
   property var onboard: null
   property var skippedSteps: []
+  // `wispd whatsnew --json`: the card for a version just installed, once
+  property var whatsnew: null
 
   onOpenedChanged: {
-    if (opened) loadOnboard()
+    if (opened) { loadOnboard(); loadWhatsnew(); if (service) service.loadConfig() }
+    else dismissWhatsnew()
     if (opened && tab === 3) loadSettings()
+    if (opened && tab === 4 && service) service.loadDev()
   }
-  onTabChanged: if (tab === 3) loadSettings()
+  onTabChanged: {
+    if (tab === 3) loadSettings()
+    if (tab === 4 && service) service.loadDev()
+  }
+
+  // the flag arrives with the config read: back to Now if it went off, read
+  // the Dev data if its tab is already the open one
+  Connections {
+    target: wisp.service
+    function onDevPanelChanged() {
+      if (!wisp.service.devPanel && wisp.tab === 4) wisp.tab = 0
+      else if (wisp.service.devPanel && wisp.opened && wisp.tab === 4) wisp.service.loadDev()
+    }
+  }
+
+  // a wrong rating asks for its note: show it on the Now tab
+  Connections {
+    target: wisp.service
+    function onRatePromptTurnChanged() {
+      if (wisp.service.ratePromptTurn !== "") wisp.tab = 0
+    }
+  }
 
   function loadOnboard() {
     if (!service || onboardStatusProc.running) return
     onboardStatusProc.command = Onboard.statusCommand(service.wispd)
     onboardStatusProc.running = true
+  }
+
+  function loadWhatsnew() {
+    if (!service || whatsnewProc.running || whatsnewSeenProc.running || whatsnew) return
+    whatsnewProc.command = WhatsNew.statusCommand(service.wispd)
+    whatsnewProc.running = true
+  }
+
+  // closing the panel (or the button) marks the version seen: shown once
+  function dismissWhatsnew() {
+    if (!whatsnew || !service) return
+    whatsnew = null
+    whatsnewSeenProc.command = WhatsNew.seenCommand(service.wispd)
+    whatsnewSeenProc.running = true
   }
 
   function onboardRun(argv) {
@@ -113,6 +157,23 @@ Panel {
     onExited: wisp.onboard = Onboard.parse(onboardOut.text)
   }
 
+  Process {
+    id: whatsnewProc
+    command: []
+    stdout: StdioCollector { id: whatsnewOut }
+    onExited: wisp.whatsnew = WhatsNew.parse(whatsnewOut.text)
+  }
+
+  Process {
+    id: whatsnewSeenProc
+    command: []
+  }
+
+  Process {
+    id: whatsnewLinkProc
+    command: []
+  }
+
   // one card action at a time; the status is re-read when it ends
   Process {
     id: onboardRunProc
@@ -168,6 +229,41 @@ Panel {
               onClicked: wisp.tab = index
             }
           }
+          // local-only marker beside the Dev tab
+          Rectangle {
+            visible: wisp.devPanelOn
+            anchors.verticalCenter: parent.verticalCenter
+            width: localBadge.implicitWidth + 2 * Style.space(6)
+            height: localBadge.implicitHeight + Style.space(2)
+            radius: Style.space(3)
+            color: "transparent"
+            border.width: 1
+            border.color: col.tk.needsYou
+            Text {
+              textFormat: Text.PlainText
+              id: localBadge
+              anchors.centerIn: parent
+              text: col.svc.ui("ui.dev.local")
+              font.capitalization: Font.AllUppercase
+              color: col.tk.needsYou
+              font.family: col.svc.fontFamily
+              font.pixelSize: Style.font.bodySmall
+            }
+          }
+        }
+
+        WhatsNewCard {
+          visible: WhatsNew.visible(wisp.whatsnew)
+          width: col.width - 2 * col.padding
+          service: col.svc
+          card: wisp.whatsnew
+          onDismiss: wisp.dismissWhatsnew()
+          onOpenLink: function (url) {
+            var argv = WhatsNew.linkCommand(url)
+            if (argv.length === 0 || whatsnewLinkProc.running) return
+            whatsnewLinkProc.command = argv
+            whatsnewLinkProc.running = true
+          }
         }
 
         FirstRunCard {
@@ -193,7 +289,11 @@ Panel {
             if (col.svc.sendChoice(pick, col.svc.promptId)) wisp.close()
           }
           onStopClicked: col.svc.interrupt()
-          onLabelClicked: function (verdict) { col.svc.label(verdict) }
+          onLabelClicked: function (verdict) { col.svc.label(verdict, col.svc.turnId, "") }
+          onNoteSaved: function (text) {
+            if (col.svc.ratePrompt !== null) col.svc.label("incorrect", col.svc.ratePrompt.turn, text)
+          }
+          onNoteSkipped: col.svc.skipRatePrompt()
         }
 
         AgentsTab {
@@ -227,7 +327,18 @@ Panel {
           }
         }
 
+        DevTab {
+          visible: wisp.devPanelOn && wisp.tab === 4
+          width: col.width - 2 * col.padding
+          service: col.svc
+          reply: col.svc.devData
+          loading: col.svc.devLoading
+          error: col.svc.devError
+          onRefresh: col.svc.loadDev()
+        }
+
         Text {
+          textFormat: Text.PlainText
           width: col.width - 2 * col.padding
           text: col.svc.ui("ui.bar.hint")
           color: col.tk.inkMuted
