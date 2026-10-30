@@ -20,7 +20,7 @@ check the commit before you run anything); nothing is installed or edited until 
 
 ```sh
 git clone https://github.com/duketopceo/wisp
-git -C wisp checkout --detach 0467ae3d0d40c6688627545f168672e46f9b3279
+git -C wisp checkout --detach 88f3014384c08b5f872fc4a3828676da22da89cf
 cd wisp
 python3 wispd install --from-plugin --dry-run   # every file, and the bind line
 python3 wispd install --from-plugin             # prints the same, then asks
@@ -46,4 +46,4 @@ Your settings and memory stay in `~/.config/wisp` and
 ## License
 
 AGPL-3.0-only, see LICENSE (releases up to v0.9.0 were MIT). Bundled
-third-party notices are in THIRD_PARTY_NOTICES.md. Version 0.9.2.
+third-party notices are in THIRD_PARTY_NOTICES.md. Version 0.9.3.

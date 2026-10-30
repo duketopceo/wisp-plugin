@@ -8,6 +8,9 @@ import "lib/tokens.js" as Tokens
 import "lib/motion.js" as Motion
 import "lib/settings.js" as Settings
 import "lib/run.js" as Run
+import "lib/rate.js" as Rate
+import "lib/bar.js" as B
+import "lib/dev.js" as Dev
 
 // WispService: the one reader of wispd state for every surface (Companion,
 // Panel, bar widget). Surfaces bind to this object (shell.serviceFor(
@@ -72,6 +75,18 @@ Item {
   property string errorCode: ""
   property var health: ({})
   property var spend: ({})
+  // {turn} while a wrong rating waits for its optional note (state.rate_prompt)
+  property var ratePrompt: null
+  // the prompted turn id, "" when none: surfaces react to this, not to the
+  // object (normalize builds a fresh {turn} on every state message)
+  readonly property string ratePromptTurn: ratePrompt ? String(ratePrompt.turn || "") : ""
+  // The bar pill's done rating window (U3): true for 8 s after a rateable
+  // turn finishes, closed by ratingTimer, a new turn or going offline.
+  // `pillHover` is set by the bar while the pointer is on the pill and
+  // pauses the window.
+  property bool ratingWindowOpen: false
+  property bool pillHover: false
+  property string mic: ""     // "open" while the opt-in wake word listens
   property string turnId: ""
   property var seq: null
   property int contractVersion: 1
@@ -126,6 +141,14 @@ Item {
   property var configErrors: ({})    // key -> message from the daemon or validator
   property string configSaved: ""    // key last written without error
 
+  // --- dev tab (U5): local only, behind `[dev] panel` -----------------------
+  // One `wispd dev turns --json` call per tab open and per refresh press,
+  // never on a timer and never with the flag off.
+  readonly property bool devPanel: configValues["dev.panel"] === "true"
+  property var devData: null         // parsed reply data, null until read
+  property bool devLoading: false
+  property string devError: ""       // "" when fine, else a short code
+
   signal stateApplied(var view)
   signal turnChanged(string turnId)
 
@@ -152,9 +175,11 @@ Item {
         message: Copy.errorMessage("stale_prompt"), at: Date.now() };
       return false;
     }
-    var cmd = [wispd, "choice", pick];
+    // The pick can be typed free text: it goes to the child's stdin, never
+    // onto the command line, which other local accounts can read.
+    var cmd = [wispd, "choice", "--stdin"];
     if (pid) cmd = cmd.concat(["--prompt-id", pid]);
-    return runAction(cmd.concat(["--json"]), "choice");
+    return runAction(cmd.concat(["--json"]), "choice", null, String(pick));
   }
   // Bar action while offline: start the user service (no daemon to ask).
   function startDaemon() { return runAction(["systemctl", "--user", "start", "wispd.service"], "daemon"); }
@@ -169,6 +194,8 @@ Item {
     return true;
   }
   function trigger() { return runAction([wispd, "trigger", "--json"], "trigger"); }
+  // A click on a part of a 3D card (B13): one typed question, a normal turn.
+  function askAbout(text) { return runAction([wispd, "ask", "--stdin", "--json"], "ask", null, String(text)); }
   // Scribble to ask (B7): the strokes drawn while listening, handed to the
   // daemon as a small file (wispd scribble). Its own subprocess: it must not
   // queue behind, or flash a result in, the one action slot. A newer payload
@@ -184,13 +211,37 @@ Item {
       : [root.wispd, "scribble", "set", "--json", JSON.stringify(p)];
     scribbleProc.running = true;
   }
-  function label(verdict) { return runAction([wispd, "label", "set", verdict, "--json"], "label"); }
+  // Rate a turn (U2): `turn` names the card's turn, `note` re-labels it with
+  // a typed note. The reply's typed status and the turn ride lastAction, so
+  // the card that asked can show its own receipt.
+  function label(verdict, turn, note) {
+    return runAction(Rate.labelCommand(wispd, verdict, turn || "", note || ""),
+                     "label", { turn: turn || "", verdict: verdict },
+                     note ? String(note) : null);
+  }
+  // Esc on the note: close it without writing a label.
+  function skipRatePrompt() { return runAction(Rate.skipCommand(wispd), "label-skip"); }
 
   // Read the settings inputs once (config, cua status, spend by model).
   function loadSettings() {
     if (!cfgProc.running) cfgProc.running = true;
     if (!cuaProc.running) cuaProc.running = true;
     if (!spendProc.running) spendProc.running = true;
+  }
+
+  // Read the config alone (the Panel needs `[dev] panel` before it knows
+  // whether the Dev tab exists).
+  function loadConfig() {
+    if (!cfgProc.running) cfgProc.running = true;
+  }
+
+  // The Dev tab's one read. Refused unless the flag is on.
+  function loadDev() {
+    if (!devPanel || devProc.running) return;
+    devLoading = true;
+    devError = "";
+    devProc.command = Dev.command(wispd);
+    devProc.running = true;
   }
 
   // Validate, then `wispd config set KEY VALUE`. A rejected value or a
@@ -236,25 +287,41 @@ Item {
   property var actionQueue: []
   property string actionVerb: ""
 
-  function _launch(cmd, verb) {
+  property var actionMeta: ({})
+  // Private text for the in-flight action's stdin (null: none). Typed
+  // answers and notes ride here, not in argv, which other local accounts
+  // can read while the process runs. One line: newlines become spaces.
+  property var actionStdin: null
+
+  function _line(s) { return s === null || s === undefined ? null : String(s).replace(/[\r\n]+/g, " "); }
+
+  function writeActionStdin() {
+    if (root.actionStdin !== null) actionProc.write(root.actionStdin + "\n");
+    root.actionStdin = null;
+  }
+
+  function _launch(cmd, verb, meta, stdin) {
+    root.actionStdin = _line(stdin);
     root.actionVerb = verb || "";
+    root.actionMeta = meta || {};
     root.lastAction = { verb: root.actionVerb, pending: true,
-                        ok: false, message: "", at: Date.now() };
+                        ok: false, message: "", at: Date.now(),
+                        turn: root.actionMeta.turn || "", verdict: root.actionMeta.verdict || "" };
     actionProc.command = cmd;
     actionProc.running = true;
   }
 
-  function runAction(cmd, verb) {
+  function runAction(cmd, verb, meta, stdin) {
     if (actionProc.running) {
       if (actionQueue.length >= 8) {
         root.lastAction = { verb: verb || "", pending: false, ok: false,
           message: Copy.errorMessage("busy"), at: Date.now() };
         return false;
       }
-      actionQueue = actionQueue.concat([{ cmd: cmd, verb: verb || "" }]);
+      actionQueue = actionQueue.concat([{ cmd: cmd, verb: verb || "", meta: meta || {}, stdin: stdin }]);
       return true;
     }
-    _launch(cmd, verb);
+    _launch(cmd, verb, meta, stdin);
     return true;
   }
 
@@ -267,11 +334,12 @@ Item {
     if (msg === "")
       msg = r.ok ? Copy.string("ui.noted") : Copy.errorMessage("internal");
     root.lastAction = { verb: root.actionVerb, pending: false,
-                        ok: r.ok, message: msg, at: Date.now() };
+                        ok: r.ok, message: msg, at: Date.now(), status: r.status || "",
+                        turn: root.actionMeta.turn || "", verdict: root.actionMeta.verdict || "" };
     if (root.actionQueue.length > 0) {
       var nxt = root.actionQueue[0];
       root.actionQueue = root.actionQueue.slice(1);
-      _launch(nxt.cmd, nxt.verb);
+      _launch(nxt.cmd, nxt.verb, nxt.meta, nxt.stdin);
     }
   }
 
@@ -279,6 +347,7 @@ Item {
     if (r.refused) refused = true;
     var v = r.view;
     var prevTurn = root.turnId;
+    var prevStatus = root.status;
     root.view = v;
     root.status = v.status;
     root.rawStatus = v.rawStatus;
@@ -306,6 +375,10 @@ Item {
     root.errorCode = v.errorCode;
     root.health = v.health;
     root.spend = v.spend;
+    var rp = v.ratePrompt;
+    var rpTurn = rp ? String(rp.turn || "") : "";
+    if (rpTurn !== root.ratePromptTurn) root.ratePrompt = rp;
+    root.mic = v.mic;
     root.seq = v.seq;
     root.contractVersion = v.contractVersion;
     root.connection = v.connection;
@@ -313,6 +386,10 @@ Item {
     root.contractNewer = v.contractNewer;
     root.stale = Reader.isStale(v, Date.now(), root.staleAfterMs);
     root.turnId = v.turnId;
+    var win = B.windowAction(prevStatus, root.status, prevTurn, v.turnId, root.offline,
+      Rate.rateable(root.status, root.answer, root.result, root.errorCode));
+    if (win === "open") root.ratingWindowOpen = true;
+    else if (win === "close") root.ratingWindowOpen = false;
     if (v.turnId !== prevTurn) root.turnChanged(v.turnId);
     root.stateApplied(v);
     if (r.resync && root.connection === "stream") root.reconnect();
@@ -406,6 +483,17 @@ Item {
     running: root.connection !== "stream" && root.status !== "idle" && root.status !== "offline"
     repeat: true
     onTriggered: stateView.reload()
+  }
+
+  // The done rating window: one single-shot, armed on the done edge (the
+  // window opening), paused while the pill is hovered, off once it fires or
+  // a new turn closes the window. Never runs at idle.
+  Timer {
+    id: ratingTimer
+    interval: B.WINDOW_MS
+    repeat: false
+    running: root.ratingWindowOpen && !root.pillHover
+    onTriggered: root.ratingWindowOpen = false
   }
 
   // Stale check ticks only while busy (nothing to age when idle).
@@ -519,12 +607,35 @@ Item {
     }
   }
 
+  Process {
+    id: devProc
+    command: [root.wispd, "dev", "turns", "--json"]
+    stdout: StdioCollector { id: devOut }
+    onExited: function (code) {
+      var r = Dev.parse(devOut.text);
+      root.devLoading = false;
+      if (r.ok) { root.devData = r.data; root.devError = ""; }
+      else root.devError = r.error || "error";
+    }
+    // a spawn failure flips running without exited
+    onRunningChanged: {
+      if (!devProc.running && root.devLoading) {
+        root.devLoading = false;
+        root.devError = "spawn";
+      }
+    }
+  }
+
   // The one action subprocess (see run/lastAction): stdout+stderr are
   // collected so a daemon refusal or a spawn failure reaches the
   // surfaces as a typed result, never silence.
   Process {
     id: actionProc
     command: [root.wispd, "status"]
+    // stdin stays open for the whole run: a command that takes typed text
+    // reads one line from it (--stdin), the others never read it.
+    stdinEnabled: true
+    onStarted: root.writeActionStdin()
     stdout: StdioCollector { id: actionOut }
     stderr: StdioCollector { id: actionErr }
     onExited: function (code, status) { root.finishAction(code); }
